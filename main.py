@@ -37,6 +37,10 @@ class JSONToXMLConverter:
             result = result.replace(old_char, new_char)
         return result
     
+    def is_xml_content(self, text: str) -> bool:
+        """Check if text contains XML content."""
+        return isinstance(text, str) and text.strip().startswith('<?xml') and text.strip().endswith('>')
+    
     def json_to_xml_element(self, data: Union[Dict, list, str, int, float, bool], 
                            parent_element: ET.Element = None, 
                            element_name: str = "root") -> ET.Element:
@@ -78,17 +82,28 @@ class JSONToXMLConverter:
         
         return element
     
-    def convert_json_to_xml(self, json_data: Dict[str, Any]) -> str:
+    def convert_json_to_xml(self, json_data: Union[Dict[str, Any], list]) -> str:
         """
         Convert JSON data to formatted XML string.
         
         Args:
-            json_data: Dictionary containing JSON data
+            json_data: Dictionary or list containing JSON data
             
         Returns:
             str: Formatted XML string
         """
         try:
+            # Handle special case where JSON contains XML string content
+            if isinstance(json_data, list) and len(json_data) == 1:
+                item = json_data[0]
+                if isinstance(item, dict) and len(item) == 1:
+                    key, value = next(iter(item.items()))
+                    if self.is_xml_content(value):
+                        # Extract and process the XML content directly
+                        xml_content = self.apply_replacements(value)
+                        return xml_content
+            
+            # Handle regular JSON to XML conversion
             root_element = self.json_to_xml_element(json_data, element_name="document")
             
             # Create a rough XML string
@@ -127,15 +142,25 @@ class XMLToDocxConverter:
             # Add title
             title = doc.add_heading('XML Document Content', 0)
             
-            # Add XML content as formatted text
-            # Parse XML to display it in a structured way
+            # Try to parse and format XML content
             try:
+                # Parse the XML string
                 root = ET.fromstring(xml_content)
-                self._add_xml_to_document(doc, root, level=0)
-            except ET.ParseError:
-                # If XML parsing fails, add raw content
+                
+                # Add XML content in a more readable format
+                self._add_xml_elements_to_document(doc, root, level=0)
+                
+            except ET.ParseError as e:
+                logger.warning(f"XML parsing failed: {str(e)}, adding raw content")
+                # If XML parsing fails, add raw content with proper formatting
                 doc.add_paragraph("Raw XML Content:")
-                doc.add_paragraph(xml_content)
+                
+                # Split into lines and add each line as a paragraph for better readability
+                lines = xml_content.split('\n')
+                for line in lines:
+                    if line.strip():  # Skip empty lines
+                        p = doc.add_paragraph(line)
+                        p.style = 'Normal'
             
             # Save to BytesIO
             doc_buffer = io.BytesIO()
@@ -148,9 +173,9 @@ class XMLToDocxConverter:
             logger.error(f"Error creating DOCX from XML: {str(e)}")
             raise HTTPException(status_code=500, detail=f"DOCX creation failed: {str(e)}")
     
-    def _add_xml_to_document(self, doc: Document, element: ET.Element, level: int = 0):
+    def _add_xml_elements_to_document(self, doc: Document, element: ET.Element, level: int = 0):
         """
-        Recursively add XML elements to the document.
+        Add XML elements to document with better formatting for WordprocessingML.
         
         Args:
             doc: Document object
@@ -159,23 +184,34 @@ class XMLToDocxConverter:
         """
         indent = "  " * level
         
-        # Add element name
+        # For WordprocessingML, we want to show the structure more clearly
         if element.tag:
-            para = doc.add_paragraph(f"{indent}<{element.tag}>")
-            para.style = 'Normal'
-        
-        # Add text content if exists
-        if element.text and element.text.strip():
-            text_para = doc.add_paragraph(f"{indent}  {element.text.strip()}")
-            text_para.style = 'Normal'
-        
-        # Recursively add child elements
-        for child in element:
-            self._add_xml_to_document(doc, child, level + 1)
-        
-        # Add closing tag
-        if element.tag:
-            para = doc.add_paragraph(f"{indent}</{element.tag}>")
+            # Add opening tag
+            tag_text = f"{indent}<{element.tag}"
+            
+            # Add attributes if they exist
+            if element.attrib:
+                for attr_name, attr_value in element.attrib.items():
+                    tag_text += f' {attr_name}="{attr_value}"'
+            
+            if element.text and element.text.strip():
+                tag_text += f">{element.text.strip()}</{element.tag}>"
+                para = doc.add_paragraph(tag_text)
+            elif len(element) == 0:
+                tag_text += "/>"
+                para = doc.add_paragraph(tag_text)
+            else:
+                tag_text += ">"
+                para = doc.add_paragraph(tag_text)
+                
+                # Add child elements
+                for child in element:
+                    self._add_xml_elements_to_document(doc, child, level + 1)
+                
+                # Add closing tag
+                closing_para = doc.add_paragraph(f"{indent}</{element.tag}>")
+            
+            # Set paragraph style
             para.style = 'Normal'
 
 
@@ -210,6 +246,11 @@ async def convert_json_to_docx(file: UploadFile = File(...)):
             raise HTTPException(
                 status_code=400,
                 detail=f"Invalid JSON format: {str(e)}"
+            )
+        except UnicodeDecodeError as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"File encoding error: {str(e)}"
             )
         
         logger.info(f"Processing JSON file: {file.filename}")
