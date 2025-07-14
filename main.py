@@ -1,174 +1,266 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import Response
+from fastapi.responses import StreamingResponse
 import json
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
+import io
+from docx import Document
+from docx.shared import Inches
 import logging
-from datetime import datetime
+from typing import Dict, Any, Union
+import re
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="JSON to XML Converter API",
-    description="Convert JSON binary files to XML binary files",
+    title="JSON to DOCX Converter API",
+    description="Convert JSON files to XML and then to DOCX with character replacements",
     version="1.0.0"
 )
 
-class JsonToXmlConverter:
-    """Utility class for converting JSON to XML"""
+
+class JSONToXMLConverter:
+    """Handles conversion from JSON to XML with character replacements."""
     
-    @staticmethod
-    def dict_to_xml(data, root_name="root"):
-        """Convert a dictionary to XML element"""
-        def build_xml_element(parent, key, value):
-            """Recursively build XML elements"""
-            if isinstance(value, dict):
-                # Create element for dictionary
-                element = ET.SubElement(parent, str(key))
-                for k, v in value.items():
-                    build_xml_element(element, k, v)
-            elif isinstance(value, list):
-                # Handle lists
-                for i, item in enumerate(value):
-                    if isinstance(item, dict):
-                        # Create element for each dictionary in list
-                        list_element = ET.SubElement(parent, str(key))
-                        for k, v in item.items():
-                            build_xml_element(list_element, k, v)
-                    else:
-                        # Create element for each primitive in list
-                        list_element = ET.SubElement(parent, str(key))
-                        list_element.text = str(item)
-            else:
-                # Handle primitive values
-                element = ET.SubElement(parent, str(key))
-                element.text = str(value) if value is not None else ""
+    def __init__(self):
+        self.replacements = {
+            '_': ':',
+            '$': '@'
+        }
+    
+    def apply_replacements(self, text: str) -> str:
+        """Apply character replacements to text."""
+        result = text
+        for old_char, new_char in self.replacements.items():
+            result = result.replace(old_char, new_char)
+        return result
+    
+    def json_to_xml_element(self, data: Union[Dict, list, str, int, float, bool], 
+                           parent_element: ET.Element = None, 
+                           element_name: str = "root") -> ET.Element:
+        """
+        Recursively convert JSON data to XML elements.
         
-        # Create root element
-        root = ET.Element(root_name)
+        Args:
+            data: JSON data to convert
+            parent_element: Parent XML element
+            element_name: Name for the current element
+            
+        Returns:
+            ET.Element: XML element
+        """
+        # Apply character replacements to element name
+        clean_element_name = self.apply_replacements(element_name)
+        
+        # Ensure element name is valid XML
+        clean_element_name = re.sub(r'[^a-zA-Z0-9:@._-]', '_', clean_element_name)
+        if clean_element_name and clean_element_name[0].isdigit():
+            clean_element_name = f"item_{clean_element_name}"
+        
+        element = ET.Element(clean_element_name)
         
         if isinstance(data, dict):
             for key, value in data.items():
-                build_xml_element(root, key, value)
+                child_element = self.json_to_xml_element(value, element, key)
+                element.append(child_element)
+                
         elif isinstance(data, list):
             for i, item in enumerate(data):
-                build_xml_element(root, f"item_{i}", item)
+                child_element = self.json_to_xml_element(item, element, f"item_{i}")
+                element.append(child_element)
+                
         else:
-            root.text = str(data)
+            # For primitive values, apply replacements to the text content
+            text_content = str(data)
+            element.text = self.apply_replacements(text_content)
         
-        return root
+        return element
     
-    @staticmethod
-    def prettify_xml(element):
-        """Return a pretty-printed XML string"""
-        rough_string = ET.tostring(element, encoding='unicode')
-        reparsed = minidom.parseString(rough_string)
-        return reparsed.toprettyxml(indent="  ")
-    
-    @staticmethod
-    def convert_json_to_xml(json_content: str, root_name: str = "root") -> str:
-        """Convert JSON string to XML string"""
+    def convert_json_to_xml(self, json_data: Dict[str, Any]) -> str:
+        """
+        Convert JSON data to formatted XML string.
+        
+        Args:
+            json_data: Dictionary containing JSON data
+            
+        Returns:
+            str: Formatted XML string
+        """
         try:
-            # Parse JSON
-            data = json.loads(json_content)
+            root_element = self.json_to_xml_element(json_data, element_name="document")
             
-            # Convert to XML
-            xml_element = JsonToXmlConverter.dict_to_xml(data, root_name)
+            # Create a rough XML string
+            rough_string = ET.tostring(root_element, encoding='unicode')
             
-            # Pretty print XML
-            xml_string = JsonToXmlConverter.prettify_xml(xml_element)
+            # Pretty print the XML
+            reparsed = minidom.parseString(rough_string)
+            pretty_xml = reparsed.toprettyxml(indent="  ")
             
-            return xml_string
+            # Remove empty lines
+            lines = [line for line in pretty_xml.split('\n') if line.strip()]
+            return '\n'.join(lines)
             
-        except json.JSONDecodeError as e:
-            logger.error(f"JSON parsing error: {e}")
-            raise HTTPException(status_code=400, detail=f"Invalid JSON format: {e}")
         except Exception as e:
-            logger.error(f"XML conversion error: {e}")
-            raise HTTPException(status_code=500, detail=f"Error converting JSON to XML: {e}")
+            logger.error(f"Error converting JSON to XML: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"XML conversion failed: {str(e)}")
 
-@app.post("/convert-json-to-xml")
-async def convert_json_to_xml(
-    file: UploadFile = File(...),
-    root_element: str = "root"
-):
-    """
-    Convert JSON binary file to XML binary file
+
+class XMLToDocxConverter:
+    """Handles conversion from XML to DOCX."""
     
-    Args:
-        file: JSON binary file to convert
-        root_element: Name of the root XML element (default: "root")
-    
-    Returns:
-        XML file as binary response
-    """
-    # Validate file type
-    if not file.filename.lower().endswith('.json'):
-        raise HTTPException(status_code=400, detail="File must be a JSON file")
-    
-    if file.content_type and file.content_type not in ['application/json', 'text/json', 'application/octet-stream']:
-        logger.warning(f"Unexpected content type: {file.content_type}")
-    
-    try:
-        # Read file content
-        content = await file.read()
+    def create_docx_from_xml(self, xml_content: str) -> io.BytesIO:
+        """
+        Create a DOCX document from XML content.
         
-        if len(content) == 0:
-            raise HTTPException(status_code=400, detail="Empty file uploaded")
-        
-        # Decode JSON content
+        Args:
+            xml_content: XML content as string
+            
+        Returns:
+            io.BytesIO: DOCX file as bytes
+        """
         try:
-            json_content = content.decode('utf-8')
-        except UnicodeDecodeError:
+            # Create a new Document
+            doc = Document()
+            
+            # Add title
+            title = doc.add_heading('XML Document Content', 0)
+            
+            # Add XML content as formatted text
+            # Parse XML to display it in a structured way
             try:
-                json_content = content.decode('utf-8-sig')  # Try with BOM
-            except UnicodeDecodeError:
-                raise HTTPException(status_code=400, detail="Invalid file encoding. Please use UTF-8 encoded JSON file")
+                root = ET.fromstring(xml_content)
+                self._add_xml_to_document(doc, root, level=0)
+            except ET.ParseError:
+                # If XML parsing fails, add raw content
+                doc.add_paragraph("Raw XML Content:")
+                doc.add_paragraph(xml_content)
+            
+            # Save to BytesIO
+            doc_buffer = io.BytesIO()
+            doc.save(doc_buffer)
+            doc_buffer.seek(0)
+            
+            return doc_buffer
+            
+        except Exception as e:
+            logger.error(f"Error creating DOCX from XML: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"DOCX creation failed: {str(e)}")
+    
+    def _add_xml_to_document(self, doc: Document, element: ET.Element, level: int = 0):
+        """
+        Recursively add XML elements to the document.
+        
+        Args:
+            doc: Document object
+            element: XML element
+            level: Indentation level
+        """
+        indent = "  " * level
+        
+        # Add element name
+        if element.tag:
+            para = doc.add_paragraph(f"{indent}<{element.tag}>")
+            para.style = 'Normal'
+        
+        # Add text content if exists
+        if element.text and element.text.strip():
+            text_para = doc.add_paragraph(f"{indent}  {element.text.strip()}")
+            text_para.style = 'Normal'
+        
+        # Recursively add child elements
+        for child in element:
+            self._add_xml_to_document(doc, child, level + 1)
+        
+        # Add closing tag
+        if element.tag:
+            para = doc.add_paragraph(f"{indent}</{element.tag}>")
+            para.style = 'Normal'
+
+
+# Initialize converters
+json_to_xml_converter = JSONToXMLConverter()
+xml_to_docx_converter = XMLToDocxConverter()
+
+
+@app.post("/convert-json-to-docx/")
+async def convert_json_to_docx(file: UploadFile = File(...)):
+    """
+    Convert uploaded JSON file to DOCX format.
+    
+    - Accepts JSON file
+    - Converts to XML with character replacements (_ -> :, $ -> @)
+    - Converts XML to DOCX binary file
+    - Returns DOCX file for download
+    """
+    try:
+        # Validate file type
+        if not file.filename.endswith('.json'):
+            raise HTTPException(
+                status_code=400, 
+                detail="Only JSON files are accepted"
+            )
+        
+        # Read and parse JSON file
+        content = await file.read()
+        try:
+            json_data = json.loads(content.decode('utf-8'))
+        except json.JSONDecodeError as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid JSON format: {str(e)}"
+            )
+        
+        logger.info(f"Processing JSON file: {file.filename}")
         
         # Convert JSON to XML
-        xml_content = JsonToXmlConverter.convert_json_to_xml(json_content, root_element)
+        xml_content = json_to_xml_converter.convert_json_to_xml(json_data)
+        logger.info("JSON to XML conversion completed")
         
-        # Generate output filename
-        base_filename = file.filename.rsplit('.', 1)[0]
-        xml_filename = f"{base_filename}.xml"
+        # Convert XML to DOCX
+        docx_buffer = xml_to_docx_converter.create_docx_from_xml(xml_content)
+        logger.info("XML to DOCX conversion completed")
         
-        # Return XML as binary response
-        return Response(
-            content=xml_content.encode('utf-8'),
-            media_type="application/xml",
+        # Prepare response
+        output_filename = file.filename.replace('.json', '.docx')
+        
+        return StreamingResponse(
+            io.BytesIO(docx_buffer.getvalue()),
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             headers={
-                "Content-Disposition": f"attachment; filename={xml_filename}",
-                "Content-Type": "application/xml; charset=utf-8"
+                "Content-Disposition": f"attachment; filename={output_filename}"
             }
         )
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Unexpected error in convert_json_to_xml: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {e}")
+        logger.error(f"Unexpected error: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"An unexpected error occurred: {str(e)}"
+        )
 
-@app.get("/")
-async def root():
-    """Root endpoint with API information"""
-    return {
-        "message": "JSON to XML Converter API",
-        "version": "1.0.0",
-        "endpoint": "/convert-json-to-xml",
-        "description": "Convert JSON binary files to XML binary files",
-        "usage": "POST /convert-json-to-xml with JSON file in form-data"
-    }
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
+    """Health check endpoint."""
+    return {"status": "healthy", "message": "JSON to DOCX Converter API is running"}
+
+
+@app.get("/")
+async def root():
+    """Root endpoint with API information."""
     return {
-        "status": "healthy", 
-        "timestamp": datetime.now().isoformat(),
-        "service": "JSON to XML Converter"
+        "message": "JSON to DOCX Converter API",
+        "version": "1.0.0",
+        "endpoints": {
+            "convert": "/convert-json-to-docx/",
+            "health": "/health"
+        }
     }
+
 
 if __name__ == "__main__":
     import uvicorn
